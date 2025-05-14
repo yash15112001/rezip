@@ -22,19 +22,21 @@ func main() {
 		exitWithError("Repackaging", err)
 	}
 
-	// Optionally validate the output.
-	if cliOptions.Validate {
-		valid, err := validate.Run(cliOptions.OutputZipPath, fileMetadata)
-		if err != nil {
-			exitWithError("Validation", err)
-		}
-
-		fmt.Printf("Successfully repackaged %s to %s and performed validation. Validation status: %v\n",
-			cliOptions.InputZipPath, cliOptions.OutputZipPath, valid)
-	} else {
+	if !cliOptions.Validate {
 		fmt.Printf("Successfully repackaged %s to %s.\n",
 			cliOptions.InputZipPath, cliOptions.OutputZipPath)
+		return
 	}
+
+	valid, err := validate.Run(cliOptions.OutputZipPath, fileMetadata)
+	if err != nil {
+		fmt.Printf("Successfully repackaged %s to %s, but validation encountered an error: %s\n",
+			cliOptions.InputZipPath, cliOptions.OutputZipPath, err)
+		return
+	}
+
+	fmt.Printf("Successfully repackaged %s to %s and performed validation. Validation status: %v\n",
+		cliOptions.InputZipPath, cliOptions.OutputZipPath, valid)
 }
 
 // exitWithError prints a formatted error message and exits the program.
