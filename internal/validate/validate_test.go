@@ -5,145 +5,342 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"github.com/yash15112001/rezip/internal/repackage"
 )
 
-// helper to create a zip file at path with given entries mapping name->content
-func makeZip(path string, entries map[string]string) error {
-	f, err := os.Create(path)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-	zw := zip.NewWriter(f)
-	defer zw.Close()
+func TestRun(t *testing.T) {
+	t.Run("Returns error when can't read output zip", func(t *testing.T) {
+		tempDir := t.TempDir()
+		nonexistentPath := filepath.Join(tempDir, "nonexistent.zip")
+
+		allMatch, err := Run(nonexistentPath, map[string]repackage.FileInfo{})
+
+		assert.Error(t, err)
+		assert.False(t, allMatch)
+		assert.Contains(t, err.Error(), "failed to open output zip")
+	})
+
+	t.Run("Returns error when hash validation fails", func(t *testing.T) {
+		tempDir := t.TempDir()
+		zipPath := filepath.Join(tempDir, "output.zip")
+
+		entries := map[string]string{
+			"file1.txt": "content1",
+		}
+		makeTestZip(t, zipPath, entries)
+
+		// Create expected files map with a file that doesn't exist in the zip to simulate validation failure.
+		expected := map[string]repackage.FileInfo{
+			"missing-file.txt": {
+				OriginalPath: "original/missing-file.txt",
+				Hash:         [32]byte{},
+			},
+		}
+
+		allMatch, err := Run(zipPath, expected)
+
+		assert.Error(t, err)
+		assert.False(t, allMatch)
+		assert.Contains(t, err.Error(), "missing file in output zip: missing-file.txt")
+
+		reportPath := filepath.Join(tempDir, "output_validation.json")
+		_, err = os.Stat(reportPath)
+		assert.True(t, os.IsNotExist(err), "Report file should not exist when validation errors occur")
+	})
+
+	t.Run("Returns error when can't write the validation report", func(t *testing.T) {
+		tempDir := t.TempDir()
+
+		// Create a read-only subdirectory.
+		readOnlyDir := filepath.Join(tempDir, "readonly")
+		err := os.Mkdir(readOnlyDir, 0755)
+		require.NoError(t, err)
+
+		// Create a test ZIP file
+		zipPath := filepath.Join(readOnlyDir, "output.zip")
+		entries := map[string]string{
+			"file1.txt": "content1",
+		}
+		makeTestZip(t, zipPath, entries)
+
+		// Build expected files map.
+		expected := buildExpectedFilesMap(t, zipPath)
+
+		// Make the directory read-only to cause report writing to fail.
+		err = os.Chmod(readOnlyDir, 0555)
+		require.NoError(t, err)
+
+		allMatch, err := Run(zipPath, expected)
+
+		assert.Error(t, err)
+		assert.False(t, allMatch)
+		assert.Contains(t, err.Error(), "failed to create validation report file")
+
+		// Restore permissions for cleanup.
+		os.Chmod(readOnlyDir, 0755)
+	})
+
+	t.Run("Successfully completes the validation process and writes the validation report", func(t *testing.T) {
+		tempDir := t.TempDir()
+		zipPath := filepath.Join(tempDir, "output.zip")
+
+		entries := map[string]string{
+			"file1.txt": "content1",
+			"file2.txt": "content2",
+			"file3.txt": "content3",
+		}
+		makeTestZip(t, zipPath, entries)
+
+		// Build expected files map with correct hashes.
+		expected := buildExpectedFilesMap(t, zipPath)
+
+		_, err := Run(zipPath, expected)
+
+		assert.NoError(t, err, "Validation process should complete without errors")
+
+		reportPath := filepath.Join(tempDir, "output_validation.json")
+		assert.FileExists(t, reportPath)
+
+		// Verify report contains valid JSON.
+		reportData, err := os.ReadFile(reportPath)
+		assert.NoError(t, err)
+
+		var results []validationResult
+		err = json.Unmarshal(reportData, &results)
+		assert.NoError(t, err, "Report should contain valid JSON")
+		assert.NotEmpty(t, results, "Report should contain validation results")
+	})
+}
+
+func TestReadOutputZip(t *testing.T) {
+	t.Run("Returns error when can't open output zip", func(t *testing.T) {
+		tempDir := t.TempDir()
+		nonexistentPath := filepath.Join(tempDir, "nonexistent.zip")
+
+		zipReader, actualFiles, err := readOutputZip(nonexistentPath)
+
+		assert.Error(t, err)
+		assert.Nil(t, zipReader)
+		assert.Nil(t, actualFiles)
+		assert.Contains(t, err.Error(), "failed to open output zip")
+	})
+
+	t.Run("Successfully reads output ZIP", func(t *testing.T) {
+		tempDir := t.TempDir()
+		zipPath := filepath.Join(tempDir, "output.zip")
+
+		entries := map[string]string{
+			"file1.txt": "content1",
+			"file2.txt": "content2",
+		}
+		makeTestZip(t, zipPath, entries)
+
+		zipReader, actualFiles, err := readOutputZip(zipPath)
+
+		assert.NoError(t, err)
+		assert.NotNil(t, zipReader)
+		assert.Len(t, actualFiles, 2, "Should have 2 files")
+		assert.Contains(t, actualFiles, "file1.txt")
+		assert.Contains(t, actualFiles, "file2.txt")
+
+		defer zipReader.Close()
+	})
+}
+
+func TestValidateFileHashes(t *testing.T) {
+	t.Run("Returns error when certain file is missing in output zip", func(t *testing.T) {
+		tempDir := t.TempDir()
+		zipPath := filepath.Join(tempDir, "output.zip")
+
+		entries := map[string]string{
+			"file1.txt": "content1",
+		}
+		makeTestZip(t, zipPath, entries)
+
+		zipReader, err := zip.OpenReader(zipPath)
+		require.NoError(t, err)
+		defer zipReader.Close()
+
+		actualFiles := make(map[string]*zip.File)
+		for _, file := range zipReader.File {
+			actualFiles[file.Name] = file
+		}
+
+		expected := buildExpectedFilesMap(t, zipPath)
+		expected["missing.txt"] = repackage.FileInfo{
+			OriginalPath: "missing.txt",
+			Hash:         [32]byte{},
+		}
+
+		results, allMatch, err := validateFileHashes(actualFiles, expected)
+
+		assert.Error(t, err)
+		assert.False(t, allMatch)
+		assert.Nil(t, results)
+		assert.Contains(t, err.Error(), "missing file in output zip: missing.txt")
+	})
+
+	t.Run("Successfully validates matching hashes", func(t *testing.T) {
+		tempDir := t.TempDir()
+		zipPath := filepath.Join(tempDir, "output.zip")
+
+		entries := map[string]string{
+			"file1.txt": "content1",
+			"file2.txt": "content2",
+		}
+		makeTestZip(t, zipPath, entries)
+
+		zipReader, err := zip.OpenReader(zipPath)
+		require.NoError(t, err)
+		defer zipReader.Close()
+
+		actualFiles := make(map[string]*zip.File)
+		for _, file := range zipReader.File {
+			actualFiles[file.Name] = file
+		}
+		expected := buildExpectedFilesMap(t, zipPath)
+
+		results, allMatch, err := validateFileHashes(actualFiles, expected)
+
+		assert.NoError(t, err)
+		assert.True(t, allMatch)
+		assert.Len(t, results, 2)
+
+		for _, result := range results {
+			assert.True(t, result.Match)
+		}
+	})
+
+	t.Run("Successfully returns false with mismatched hashes", func(t *testing.T) {
+		tempDir := t.TempDir()
+		zipPath := filepath.Join(tempDir, "output.zip")
+
+		entries := map[string]string{
+			"file1.txt": "content1",
+			"file2.txt": "content2",
+		}
+		makeTestZip(t, zipPath, entries)
+
+		zipReader, err := zip.OpenReader(zipPath)
+		require.NoError(t, err)
+		defer zipReader.Close()
+
+		actualFiles := make(map[string]*zip.File)
+		for _, file := range zipReader.File {
+			actualFiles[file.Name] = file
+		}
+
+		// Create expected files map and corrupt one hash.
+		expected := buildExpectedFilesMap(t, zipPath)
+		expected["file1.txt"] = repackage.FileInfo{
+			OriginalPath: expected["file1.txt"].OriginalPath,
+			Hash:         corruptHash(expected["file1.txt"].Hash),
+		}
+
+		results, allMatch, err := validateFileHashes(actualFiles, expected)
+
+		assert.NoError(t, err)
+		assert.False(t, allMatch)
+		assert.Len(t, results, 2)
+	})
+}
+
+func TestWriteValidationReport(t *testing.T) {
+	t.Run("Returns error when report cannot be created", func(t *testing.T) {
+		tempDir := t.TempDir()
+
+		reportDir := filepath.Join(tempDir, "readonly")
+		err := os.Mkdir(reportDir, 0755)
+		require.NoError(t, err)
+
+		zipPath := filepath.Join(reportDir, "output.zip")
+
+		// Make the directory read-only to cause file creation to fail.
+		err = os.Chmod(reportDir, 0555)
+		require.NoError(t, err)
+
+		err = writeValidationReport(zipPath, []validationResult{})
+
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "failed to create validation report file")
+	})
+
+	t.Run("Successfully writes validation report", func(t *testing.T) {
+		tempDir := t.TempDir()
+		zipPath := filepath.Join(tempDir, "output.zip")
+
+		results := []validationResult{
+			{
+				FileName:     "file1.txt",
+				OriginalPath: "original/file1.txt",
+				OriginalSHA:  "aabbcc",
+				NewSHA:       "aabbcc",
+				Match:        true,
+			},
+			{
+				FileName:     "file2.txt",
+				OriginalPath: "original/file2.txt",
+				OriginalSHA:  "ddeeff",
+				NewSHA:       "112233",
+				Match:        false,
+			},
+		}
+
+		err := writeValidationReport(zipPath, results)
+
+		assert.NoError(t, err)
+
+		reportPath := filepath.Join(tempDir, "output_validation.json")
+		assert.FileExists(t, reportPath)
+	})
+}
+
+// Helper to create a zip file at path with given entries mapping name->content.
+func makeTestZip(t *testing.T, path string, entries map[string]string) {
+	zipFile, err := os.Create(path)
+	require.NoError(t, err, "Failed to create test ZIP file")
+	defer zipFile.Close()
+
+	zipWriter := zip.NewWriter(zipFile)
+	defer zipWriter.Close()
 
 	for name, content := range entries {
-		w, err := zw.Create(name)
-		if err != nil {
-			return err
-		}
-		if _, err := w.Write([]byte(content)); err != nil {
-			return err
-		}
+		zipEntry, err := zipWriter.Create(name)
+		require.NoError(t, err, "Failed to create ZIP entry")
+		_, err = zipEntry.Write([]byte(content))
+		require.NoError(t, err, "Failed to write ZIP entry content")
 	}
-	return nil
 }
 
-func TestValidate_Success(t *testing.T) {
-	// Setup
-	dir := t.TempDir()
-	zipPath := filepath.Join(dir, "out.zip")
-	entries := map[string]string{
-		"a.txt": "hello",
-		"b.txt": "world",
-	}
-	if err := makeZip(zipPath, entries); err != nil {
-		t.Fatalf("failed to create test zip: %v", err)
-	}
-
-	// Build expectedFiles map using actual hashes
+func buildExpectedFilesMap(t *testing.T, zipPath string) map[string]repackage.FileInfo {
 	expected := make(map[string]repackage.FileInfo)
-	r, err := zip.OpenReader(zipPath)
-	if err != nil {
-		t.Fatalf("opening zip: %v", err)
-	}
-	defer r.Close()
-	for _, f := range r.File {
-		hash, err := repackage.HashOf(f)
-		if err != nil {
-			t.Fatalf("hashing entry: %v", err)
+
+	zipReader, err := zip.OpenReader(zipPath)
+	require.NoError(t, err, "Failed to open ZIP reader")
+	defer zipReader.Close()
+
+	for _, file := range zipReader.File {
+		hash, err := repackage.HashOf(file)
+		require.NoError(t, err, "Failed to hash ZIP entry")
+		expected[file.Name] = repackage.FileInfo{
+			OriginalPath: file.Name,
+			Hash:         hash,
 		}
-		expected[f.Name] = repackage.FileInfo{OriginalPath: f.Name, Hash: hash}
 	}
 
-	// Execute
-	ok, err := Run(zipPath, expected)
-	if err != nil {
-		t.Fatalf("expected no error, got %v", err)
-	}
-	if !ok {
-		t.Fatal("expected ok==true")
-	}
-
-	// Check report file exists and is valid JSON
-	reportPath := filepath.Join(dir, "out_validation.json")
-	data, err := os.ReadFile(reportPath)
-	if err != nil {
-		t.Fatalf("reading report: %v", err)
-	}
-	var results []validationResult
-	if err := json.Unmarshal(data, &results); err != nil {
-		t.Fatalf("invalid JSON in report: %v", err)
-	}
-	if len(results) != len(entries) {
-		t.Fatalf("expected %d results, got %d", len(entries), len(results))
-	}
+	return expected
 }
 
-func TestValidate_MissingFile(t *testing.T) {
-	// Setup zip with single entry
-	dir := t.TempDir()
-	zipPath := filepath.Join(dir, "out.zip")
-	entries := map[string]string{"a.txt": "hello"}
-	if err := makeZip(zipPath, entries); err != nil {
-		t.Fatalf("create zip: %v", err)
-	}
+func corruptHash(original [32]byte) [32]byte {
+	corrupted := original
 
-	// expectedFiles has extra key
-	expected := map[string]repackage.FileInfo{
-		"a.txt": {OriginalPath: "a.txt", Hash: [32]byte{}},
-		"b.txt": {OriginalPath: "b.txt", Hash: [32]byte{}},
+	// Change a few bytes to create a different hash.
+	for i := 0; i < 5; i++ {
+		corrupted[i] = ^corrupted[i]
 	}
-
-	// Execute
-	_, err := Run(zipPath, expected)
-	if err == nil {
-		t.Fatal("expected error for missing file, got nil")
-	}
-	if !contains(err.Error(), "missing file in output zip: b.txt") {
-		t.Fatalf("unexpected error: %v", err)
-	}
-}
-
-func TestValidate_HashMismatch(t *testing.T) {
-	// Setup zip with a.txt
-	dir := t.TempDir()
-	zipPath := filepath.Join(dir, "out.zip")
-	entries := map[string]string{"a.txt": "foo"}
-	if err := makeZip(zipPath, entries); err != nil {
-		t.Fatalf("create zip: %v", err)
-	}
-
-	// expectedFiles uses wrong hash for a.txt
-	var wrongHash [32]byte
-	for i := range wrongHash {
-		wrongHash[i] = 0xFF
-	}
-	expected := map[string]repackage.FileInfo{
-		"a.txt": {OriginalPath: "a.txt", Hash: wrongHash},
-	}
-
-	// Execute
-	ok, err := Run(zipPath, expected)
-	if err != nil {
-		t.Fatalf("expected no error on mismatch, got %v", err)
-	}
-	if ok {
-		t.Fatal("expected ok==false on hash mismatch")
-	}
-
-	// Report file should still be written
-	reportPath := filepath.Join(dir, "out_validation.json")
-	if _, err := os.Stat(reportPath); err != nil {
-		t.Fatalf("expected report file, got error: %v", err)
-	}
-}
-
-// contains is a helper for substring checks
-func contains(s, substr string) bool {
-	return strings.Contains(s, substr)
+	return corrupted
 }
