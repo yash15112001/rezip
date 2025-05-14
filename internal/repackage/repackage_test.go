@@ -125,6 +125,23 @@ func TestRun(t *testing.T) {
 }
 
 func TestFlattenAndDeduplicate(t *testing.T) {
+	t.Run("Returns error when hash comparision fails", func(t *testing.T) {
+		// Build a valid zip.File for "dir1/file.txt"
+		goodFile := createTestZipFile("dir1/file.txt", "some content")
+
+		// Build a “corrupted” zip.File for "dir2/file.txt" that errors in HashOf
+		// which will result in an error in areFileHashesIdentical.
+		badFile := makeCorruptedZipFile(t, "dir2/file.txt", []byte("some content"))
+
+		files := []*zip.File{goodFile, badFile}
+		deduped, err := flattenAndDeduplicate(files)
+
+		require.Error(t, err)
+		assert.Contains(t, err.Error(),
+			`failed comparing files with name "file.txt"`)
+		assert.Nil(t, deduped)
+	})
+
 	t.Run("Returns error when files with same name and size have different hash", func(t *testing.T) {
 		// Create files with same name and size but different content.
 		file1 := createTestZipFile("dir1/file.txt", "content1")
@@ -476,4 +493,26 @@ func assertZipHasExpectedContent(t *testing.T, zipPath, fileName, expectedConten
 	}
 
 	assert.True(t, found, "File %s not found in ZIP", fileName)
+}
+
+// makeCorruptedZipFile builds a one-entry ZIP in memory, then
+// mutates its Method so that calling File.Open() will fail.
+func makeCorruptedZipFile(t *testing.T, name string, content []byte) *zip.File {
+	buf := new(bytes.Buffer)
+	zipWriter := zip.NewWriter(buf)
+
+	writer, err := zipWriter.Create(name)
+	require.NoError(t, err)
+	_, err = writer.Write(content)
+	require.NoError(t, err)
+
+	require.NoError(t, zipWriter.Close())
+
+	zipReader, err := zip.NewReader(bytes.NewReader(buf.Bytes()), int64(buf.Len()))
+	require.NoError(t, err)
+
+	file := zipReader.File[0]
+	// unsupported method triggers an Open() error.
+	file.Method = 9999
+	return file
 }

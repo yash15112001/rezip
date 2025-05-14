@@ -2,6 +2,7 @@ package validate
 
 import (
 	"archive/zip"
+	"bytes"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -184,6 +185,25 @@ func TestValidateFileHashes(t *testing.T) {
 		assert.Contains(t, err.Error(), "missing file in output zip: missing.txt")
 	})
 
+	t.Run("Returns error when hash computation of certain file fails", func(t *testing.T) {
+		// Use the helper to get a *zip.File that errors on Open() to simulate a hash computation failure.
+		corruptedFile := makeCorruptedZipFile(t, "bad.txt", []byte("hello world"))
+
+		actualFiles := map[string]*zip.File{"bad.txt": corruptedFile}
+		var dummyHash [32]byte
+		expected := map[string]repackage.FileInfo{
+			"bad.txt": {Hash: dummyHash, OriginalPath: "irrelevant"},
+		}
+
+		results, allMatch, err := validateFileHashes(actualFiles, expected)
+
+		require.Error(t, err)
+		assert.Contains(t, err.Error(),
+			"failed to compute hash for output file 'bad.txt'")
+		assert.Nil(t, results)
+		assert.False(t, allMatch)
+	})
+
 	t.Run("Successfully validates matching hashes", func(t *testing.T) {
 		tempDir := t.TempDir()
 		zipPath := filepath.Join(tempDir, "output.zip")
@@ -343,4 +363,26 @@ func corruptHash(original [32]byte) [32]byte {
 		corrupted[i] = ^corrupted[i]
 	}
 	return corrupted
+}
+
+// makeCorruptedZipFile builds a one-entry ZIP in memory, then
+// mutates its Method so that calling File.Open() will fail.
+func makeCorruptedZipFile(t *testing.T, name string, content []byte) *zip.File {
+	buf := new(bytes.Buffer)
+	zipWriter := zip.NewWriter(buf)
+
+	writer, err := zipWriter.Create(name)
+	require.NoError(t, err)
+	_, err = writer.Write(content)
+	require.NoError(t, err)
+
+	require.NoError(t, zipWriter.Close())
+
+	zipReader, err := zip.NewReader(bytes.NewReader(buf.Bytes()), int64(buf.Len()))
+	require.NoError(t, err)
+
+	file := zipReader.File[0]
+	// unsupported method triggers an Open() error.
+	file.Method = 9999
+	return file
 }
